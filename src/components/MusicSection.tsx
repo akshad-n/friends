@@ -1,9 +1,10 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import confetti from 'canvas-confetti';
 import { useApp } from '../context/AppContext';
 import { Song, MoodType } from '../types';
 import { CatsMusicHeadphones, PeachSparkle } from './KawaiiCats';
 import { RomanticDivider } from './FloralDecorations';
+import { isDefaultDemoSong } from '../lib/cloudStore';
 import {
   Plus,
   Play,
@@ -24,6 +25,8 @@ import {
   Edit3,
   Clipboard,
   Loader2,
+  Cloud,
+  RefreshCw,
 } from 'lucide-react';
 
 export const MOOD_DETAILS: Record<
@@ -339,13 +342,63 @@ export const MusicSection: React.FC = () => {
     songReplies,
     addSongReply,
     coupleSpace,
+    isCloudSynced,
+    refreshCloudSongs,
   } = useApp();
 
   const [activeTab, setActiveTab] = useState<'both' | 'her' | 'him'>('both');
   const [activeMoodFilter, setActiveMoodFilter] = useState<MoodType | 'all'>('all');
-  const [selectedSong, setSelectedSong] = useState<Song | null>(
-    herSongs[0] || hisSongs[0] || null
-  );
+  const [isRefreshingSync, setIsRefreshingSync] = useState(false);
+
+  // Initialize selectedSong with first custom song, or first available song
+  const [selectedSong, setSelectedSong] = useState<Song | null>(() => {
+    const all = [...herSongs, ...hisSongs];
+    const custom = all.find((s) => !isDefaultDemoSong(s));
+    return custom || all[0] || null;
+  });
+
+  // Keep selectedSong automatically synced: switch away from default demo songs when custom songs exist
+  useEffect(() => {
+    const all = [...herSongs, ...hisSongs];
+    if (all.length === 0) {
+      setSelectedSong(null);
+      return;
+    }
+
+    const currentStillExists = selectedSong && all.some((s) => s.id === selectedSong.id);
+    const isCurrentDefault = selectedSong && isDefaultDemoSong(selectedSong);
+    const hasCustomSongs = all.some((s) => !isDefaultDemoSong(s));
+
+    if (!selectedSong || !currentStillExists || (isCurrentDefault && hasCustomSongs)) {
+      const firstCustom = all.find((s) => !isDefaultDemoSong(s));
+      setSelectedSong(firstCustom || all[0]);
+    }
+  }, [herSongs, hisSongs]);
+
+  const hasDemoSongs = allSongs.some((s) => isDefaultDemoSong(s));
+
+  const handleManualSync = async () => {
+    setIsRefreshingSync(true);
+    try {
+      await refreshCloudSongs();
+    } finally {
+      setTimeout(() => setIsRefreshingSync(false), 500);
+    }
+  };
+
+  const handleClearDemoSongs = async () => {
+    if (
+      window.confirm(
+        'Clear the default demo songs? 🌷\n\nThis will remove the placeholder demo songs so you only have your own dedicated songs!'
+      )
+    ) {
+      const demoSongs = allSongs.filter((s) => isDefaultDemoSong(s));
+      for (const d of demoSongs) {
+        await removeSong(d.id);
+      }
+      setSelectedSong(null);
+    }
+  };
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [targetPlaylist, setTargetPlaylist] = useState<'her' | 'him'>('him');
   const [replyingSong, setReplyingSong] = useState<Song | null>(null);
@@ -609,6 +662,9 @@ export const MusicSection: React.FC = () => {
         origin: { y: 0.6 },
         colors: ['#F6C9D2', '#ECA4B2', '#FFE8A3', '#DCEFE3', '#FFFFFF'],
       });
+      if (result.song) {
+        setSelectedSong(result.song);
+      }
       setIsModalOpen(false);
       setActiveTab(targetPlaylist);
     }
@@ -793,8 +849,8 @@ export const MusicSection: React.FC = () => {
       </section>
 
       {/* Playlist Controls & Add Button */}
-      <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mb-6">
-        <div className="flex items-center gap-2 bg-cream-50 p-1.5 rounded-full border-2 border-chocolate/15">
+      <div className="flex flex-col sm:flex-row items-center justify-between gap-4 mb-4">
+        <div className="flex items-center gap-2 bg-cream-50 p-1.5 rounded-full border-2 border-chocolate/15 flex-wrap justify-center">
           <button
             onClick={() => setActiveTab('both')}
             className={`px-4 py-1.5 rounded-full text-xs font-bold transition-all ${
@@ -845,6 +901,35 @@ export const MusicSection: React.FC = () => {
             <span>Add a Song + 🎶</span>
           </button>
         </div>
+      </div>
+
+      {/* Cloud Sync Status Bar & Demo Song Cleaner */}
+      <div className="flex items-center justify-between flex-wrap gap-2 mb-6 px-3 py-2 rounded-2xl bg-white/70 border border-chocolate/10 text-xs shadow-2xs">
+        <div className="flex items-center gap-2">
+          <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-800 text-[11px] font-bold border border-emerald-300">
+            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
+            <span>Live Cloud Synced (Saved on all devices)</span>
+          </div>
+          <button
+            onClick={handleManualSync}
+            disabled={isRefreshingSync}
+            className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full border border-chocolate/20 bg-cream-50 hover:bg-cream-100 text-chocolate/75 hover:text-chocolate text-[11px] font-semibold transition-all active:scale-95 disabled:opacity-50"
+            title="Sync latest songs from cloud"
+          >
+            <RefreshCw size={11} className={isRefreshingSync ? 'animate-spin text-rose-deep' : ''} />
+            <span>{isRefreshingSync ? 'Syncing...' : 'Sync Now'}</span>
+          </button>
+        </div>
+
+        {hasDemoSongs && (
+          <button
+            onClick={handleClearDemoSongs}
+            className="px-2.5 py-1 rounded-full border border-rose-soft bg-rose-50 hover:bg-rose-100 text-rose-deep text-[11px] font-bold transition-all active:scale-95 ml-auto"
+            title="Remove default demo songs so you only have your own playlist"
+          >
+            🧹 Clean Demo Songs
+          </button>
+        )}
       </div>
 
       {/* Him Section Auto Song Dedication Banner */}

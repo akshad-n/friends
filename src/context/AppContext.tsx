@@ -15,6 +15,7 @@ import {
   QuestionCategory,
 } from '../types';
 import { supabase, isSupabaseConfigured } from '../lib/supabase';
+import { fetchCloudSongs, saveCloudSongs, isDefaultDemoSong } from '../lib/cloudStore';
 
 interface AppContextType {
   // Current user & couple
@@ -29,7 +30,10 @@ interface AppContextType {
   herSongs: Song[];
   hisSongs: Song[];
   allSongs: Song[];
-  addSong: (song: Omit<Song, 'id' | 'createdAt' | 'coupleId' | 'ownerRole' | 'ownerName'>, targetRole?: PartnerRole) => Promise<{ success: boolean; message: string }>;
+  addSong: (
+    song: Omit<Song, 'id' | 'createdAt' | 'coupleId' | 'ownerRole' | 'ownerName'>,
+    targetRole?: PartnerRole
+  ) => Promise<{ success: boolean; message: string; song?: Song }>;
   removeSong: (songId: string) => Promise<boolean>;
   songReplies: Record<string, SongReply[]>;
   addSongReply: (songId: string, content: string) => Promise<void>;
@@ -61,8 +65,10 @@ interface AppContextType {
   markAllNotificationsAsRead: () => void;
   triggerNotification: (item: Omit<NotificationItem, 'id' | 'createdAt' | 'coupleId' | 'senderRole' | 'senderName' | 'isRead'>) => void;
 
-  // Connectivity
+  // Connectivity & Real-time Cloud Sync
   isOnlineDb: boolean;
+  isCloudSynced: boolean;
+  refreshCloudSongs: () => Promise<void>;
 }
 
 const AppContext = createContext<AppContextType | null>(null);
@@ -218,6 +224,7 @@ const initialNotifications: NotificationItem[] = [
 export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => {
   // Current Partner Role: default 'her' so girlfriend sees the question/dates, but can switch instantly to 'him'
   const [currentRole, setCurrentRole] = useState<PartnerRole>('her');
+  const [isCloudSynced, setIsCloudSynced] = useState<boolean>(false);
   const [coupleSpace, setCoupleSpace] = useState<CoupleSpace>(() => {
     const saved = localStorage.getItem('olu_couple');
     return saved ? JSON.parse(saved) : initialCouple;
@@ -225,12 +232,26 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
 
   const [herSongs, setHerSongs] = useState<Song[]>(() => {
     const saved = localStorage.getItem('olu_her_songs');
-    return saved ? JSON.parse(saved) : initialHerSongs;
+    if (saved !== null) {
+      try {
+        return JSON.parse(saved);
+      } catch {
+        return [];
+      }
+    }
+    return initialHerSongs;
   });
 
   const [hisSongs, setHisSongs] = useState<Song[]>(() => {
     const saved = localStorage.getItem('olu_his_songs');
-    return saved ? JSON.parse(saved) : initialHisSongs;
+    if (saved !== null) {
+      try {
+        return JSON.parse(saved);
+      } catch {
+        return [];
+      }
+    }
+    return initialHisSongs;
   });
 
   const [songReplies, setSongReplies] = useState<Record<string, SongReply[]>>(() => {
@@ -368,15 +389,77 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
     }
   };
 
-  // 1. ADD SONG (Enforces 5-song limit strictly and persists immediately to localStorage)
+  // Cloud sync helper: fetches latest songs and replies from the shared cloud store
+  const refreshCloudSongs = async () => {
+    try {
+      const cloudData = await fetchCloudSongs();
+      if (cloudData) {
+        if (Array.isArray(cloudData.herSongs)) {
+          setHerSongs(cloudData.herSongs);
+          try {
+            localStorage.setItem('olu_her_songs', JSON.stringify(cloudData.herSongs));
+          } catch {
+            // Ignore storage errors
+          }
+        }
+        if (Array.isArray(cloudData.hisSongs)) {
+          setHisSongs(cloudData.hisSongs);
+          try {
+            localStorage.setItem('olu_his_songs', JSON.stringify(cloudData.hisSongs));
+          } catch {
+            // Ignore storage errors
+          }
+        }
+        if (cloudData.songReplies && typeof cloudData.songReplies === 'object') {
+          setSongReplies(cloudData.songReplies);
+          try {
+            localStorage.setItem('olu_song_replies', JSON.stringify(cloudData.songReplies));
+          } catch {
+            // Ignore storage errors
+          }
+        }
+        setIsCloudSynced(true);
+      }
+    } catch (err) {
+      console.warn('Failed to refresh cloud songs:', err);
+    }
+  };
+
+  // Run cloud sync on mount, tab focus, visibility change, and periodic heartbeat
+  useEffect(() => {
+    refreshCloudSongs();
+
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === 'visible') {
+        refreshCloudSongs();
+      }
+    };
+
+    window.addEventListener('visibilitychange', handleVisibilityChange);
+    window.addEventListener('focus', refreshCloudSongs);
+
+    // Sync every 25 seconds so when partner adds a song, it appears live
+    const interval = setInterval(refreshCloudSongs, 25000);
+
+    return () => {
+      window.removeEventListener('visibilitychange', handleVisibilityChange);
+      window.removeEventListener('focus', refreshCloudSongs);
+      clearInterval(interval);
+    };
+  }, []);
+
+  // 1. ADD SONG (Enforces 5-song limit, cleans default demo songs, and persists to localStorage and Cloud Store)
   const addSong = async (
     songData: Omit<Song, 'id' | 'createdAt' | 'coupleId' | 'ownerRole' | 'ownerName'>,
     targetRole?: PartnerRole
-  ): Promise<{ success: boolean; message: string }> => {
+  ): Promise<{ success: boolean; message: string; song?: Song }> => {
     const roleToUse = targetRole || currentRole;
     const targetList = roleToUse === 'her' ? herSongs : hisSongs;
 
-    if (targetList.length >= 5) {
+    // Default demo songs do not count against the limit and are cleared on first real song addition
+    const nonDefaultSongs = targetList.filter((s) => !isDefaultDemoSong(s));
+
+    if (nonDefaultSongs.length >= 5) {
       return {
         success: false,
         message: 'Your playlist already has 5 songs! 🐱 Please remove or replace one before adding a new song.',
@@ -392,27 +475,35 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       createdAt: new Date().toISOString(),
     };
 
+    let updatedHer = herSongs;
+    let updatedHis = hisSongs;
+
     if (roleToUse === 'her') {
-      setHerSongs((prev) => {
-        const updated = [newSong, ...prev.filter((s) => s.id !== newSong.id)].slice(0, 5);
-        try {
-          localStorage.setItem('olu_her_songs', JSON.stringify(updated));
-        } catch (err) {
-          console.error('Failed to save her songs to localStorage:', err);
-        }
-        return updated;
-      });
+      // Remove any default demo songs so only real chosen songs remain
+      const cleaned = herSongs.filter((s) => !isDefaultDemoSong(s) && s.id !== newSong.id);
+      updatedHer = [newSong, ...cleaned].slice(0, 5);
+      setHerSongs(updatedHer);
+      try {
+        localStorage.setItem('olu_her_songs', JSON.stringify(updatedHer));
+      } catch (err) {
+        console.error('Failed to save her songs to localStorage:', err);
+      }
     } else {
-      setHisSongs((prev) => {
-        const updated = [newSong, ...prev.filter((s) => s.id !== newSong.id)].slice(0, 5);
-        try {
-          localStorage.setItem('olu_his_songs', JSON.stringify(updated));
-        } catch (err) {
-          console.error('Failed to save his songs to localStorage:', err);
-        }
-        return updated;
-      });
+      // Remove any default demo songs so only real chosen songs remain
+      const cleaned = hisSongs.filter((s) => !isDefaultDemoSong(s) && s.id !== newSong.id);
+      updatedHis = [newSong, ...cleaned].slice(0, 5);
+      setHisSongs(updatedHis);
+      try {
+        localStorage.setItem('olu_his_songs', JSON.stringify(updatedHis));
+      } catch (err) {
+        console.error('Failed to save his songs to localStorage:', err);
+      }
     }
+
+    // Persist immediately to cloud store so partner's phone receives the update
+    saveCloudSongs(updatedHer, updatedHis, songReplies, newSong.id).catch((err) => {
+      console.warn('Background cloud save warning:', err);
+    });
 
     // Trigger notification for partner
     triggerNotification({
@@ -423,35 +514,33 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       targetSection: 'music',
     });
 
-    return { success: true, message: 'Song added to your playlist! 🎶' };
+    return { success: true, message: 'Song added to your playlist! 🎶', song: newSong };
   };
 
-  // 2. REMOVE SONG (Persists immediately to localStorage)
+  // 2. REMOVE SONG (Persists immediately to localStorage and Cloud Store)
   const removeSong = async (songId: string): Promise<boolean> => {
-    setHerSongs((prev) => {
-      const updated = prev.filter((s) => s.id !== songId);
-      try {
-        localStorage.setItem('olu_her_songs', JSON.stringify(updated));
-      } catch (err) {
-        console.error('Failed to remove her song from localStorage:', err);
-      }
-      return updated;
-    });
+    const updatedHer = herSongs.filter((s) => s.id !== songId);
+    const updatedHis = hisSongs.filter((s) => s.id !== songId);
 
-    setHisSongs((prev) => {
-      const updated = prev.filter((s) => s.id !== songId);
-      try {
-        localStorage.setItem('olu_his_songs', JSON.stringify(updated));
-      } catch (err) {
-        console.error('Failed to remove his song from localStorage:', err);
-      }
-      return updated;
+    setHerSongs(updatedHer);
+    setHisSongs(updatedHis);
+
+    try {
+      localStorage.setItem('olu_her_songs', JSON.stringify(updatedHer));
+      localStorage.setItem('olu_his_songs', JSON.stringify(updatedHis));
+    } catch (err) {
+      console.error('Failed to remove song from localStorage:', err);
+    }
+
+    // Sync removal to cloud store so partner's device also removes it
+    saveCloudSongs(updatedHer, updatedHis, songReplies).catch((err) => {
+      console.warn('Background cloud save warning:', err);
     });
 
     return true;
   };
 
-  // 3. SONG REPLIES
+  // 3. SONG REPLIES (Persists locally and to Cloud Store)
   const addSongReply = async (songId: string, content: string) => {
     const newReply: SongReply = {
       id: `sr-${Date.now()}`,
@@ -463,10 +552,22 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
       createdAt: new Date().toISOString(),
     };
 
-    setSongReplies((prev) => ({
-      ...prev,
-      [songId]: [...(prev[songId] || []), newReply],
-    }));
+    const updatedReplies = {
+      ...songReplies,
+      [songId]: [...(songReplies[songId] || []), newReply],
+    };
+
+    setSongReplies(updatedReplies);
+    try {
+      localStorage.setItem('olu_song_replies', JSON.stringify(updatedReplies));
+    } catch (err) {
+      console.error('Failed to save song replies to localStorage:', err);
+    }
+
+    // Sync replies to cloud
+    saveCloudSongs(herSongs, hisSongs, updatedReplies).catch((err) => {
+      console.warn('Background cloud save warning:', err);
+    });
 
     const targetSong = allSongs.find((s) => s.id === songId);
     triggerNotification({
@@ -740,6 +841,8 @@ export const AppProvider: React.FC<{ children: ReactNode }> = ({ children }) => 
         markAllNotificationsAsRead,
         triggerNotification,
         isOnlineDb: isSupabaseConfigured,
+        isCloudSynced,
+        refreshCloudSongs,
       }}
     >
       {children}
